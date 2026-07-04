@@ -623,7 +623,8 @@ static void hardware_input_task(void *param) {
             if (!sw_pressed) {
                 sw_pressed = true;
                 sw_press_time = now;
-                sw_long_press_triggered = false;
+                // If Left Click is held, immediately flag it as long-pressed to suppress Enter/Back actions
+                sw_long_press_triggered = (gpio_get_level(BTN_L_PIN) == 0);
             } else if (!sw_long_press_triggered && (now - sw_press_time >= 800)) {
                 sw_long_press_triggered = true;
                 if (in_settings_menu) {
@@ -929,9 +930,11 @@ static void hardware_input_task(void *param) {
                     static uint32_t last_action_time = 0;
                     static bool last_was_cw = false;
 
-                    float twist_rate = cgy / 16.4f; // degrees per second
+                    // safety check: only active when holding BOTH Left Click (BTN_L_PIN) AND Momentary Button/SW (JOG_SW_PIN)
+                    bool twist_modifier_pressed = (gpio_get_level(BTN_L_PIN) == 0) && (gpio_get_level(JOG_SW_PIN) == 0);
+                    float twist_rate = twist_modifier_pressed ? (cgy / 16.4f) : 0.0f;
                     
-                    if (fabsf(twist_rate) > 120.0f) { // require >120 deg/sec deliberate twist
+                    if (twist_modifier_pressed && fabsf(twist_rate) > 120.0f) { // require >120 deg/sec deliberate twist
                         bool is_cw = (twist_rate > 0);
                         // Anti-rebound: ignore twists in the opposite direction for 400ms (hand returning)
                         if ((now - last_action_time < 400) && (is_cw != last_was_cw)) {
@@ -940,7 +943,7 @@ static void hardware_input_task(void *param) {
                             twist_accum += twist_rate * dt_imu;
                         }
                     } else {
-                        twist_accum *= 0.6f; // high friction to kill noise
+                        twist_accum *= 0.5f; // rapidly decay accumulator when buttons released / below threshold
                     }
 
                     // 20 degrees of twist = 1 action notch
