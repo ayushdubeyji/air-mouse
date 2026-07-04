@@ -1,0 +1,40 @@
+# PlatformIO
+.pio
+.pioenvs
+.piolibdeps
+.clang_complete
+.gcc-flags.json
+*.gemini
+.codegraph/
+
+# Build artifacts
+build/
+*.bin
+*.elf
+*.map
+*.o
+*.a
+*.d
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# VS Code
+.vscode/
+
+# Local configuration / SDK configs
+sdkconfig
+sdkconfig.old
+sdkconfig.esp32-s3-lcd-2-new
+sdkconfig.esp32-s3-lcd-2
+
+# Temp/Python test files (if any)
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+*.pdf
+pdf_text.txt
