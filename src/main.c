@@ -683,80 +683,41 @@ static void hardware_input_task(void *param) {
             }
         }
 
-        // Jog Dial Up / Down Logic (Auto-repeats if held)
-        bool up_state = (gpio_get_level(JOG_UP_PIN) == 0);
-        bool dn_state = (gpio_get_level(JOG_DN_PIN) == 0);
+        // Hollow Shaft Rotary Encoder (3-Pin) Logic on JOG_UP_PIN (A) and JOG_DN_PIN (B)
+        static int last_encoder_A = 1;
+        int encoder_A = gpio_get_level(JOG_UP_PIN); // GPIO 7 (Phase A)
+        int encoder_B = gpio_get_level(JOG_DN_PIN); // GPIO 20 (Phase B)
 
-        static uint32_t up_press_start = 0;
-        static uint32_t last_up_repeat = 0;
-        static bool up_held = false;
+        if (encoder_A != last_encoder_A) {
+            // Count transitions from 1 to 0 (falling edge of Phase A)
+            if (encoder_A == 0) {
+                // If Phase B is high when Phase A falls, it is CW. Otherwise CCW.
+                bool rotate_cw = (encoder_B != 0);
 
-        if (up_state) {
-            if (!up_held) {
-                up_held = true;
-                up_press_start = now;
-                if (in_settings_menu) {
-                    menu_idx = (menu_idx - 1);
-                    if (menu_idx < 0) menu_idx = 13; // 14 items (0-13)
-                    update_settings_ui();
+                if (rotate_cw) {
+                    if (in_settings_menu) {
+                        menu_idx = (menu_idx + 1) % 14;
+                        update_settings_ui();
+                    } else {
+                        // Scroll down: Arrow Down / Arrow Right based on jog mode setting
+                        ble_mouse_send_keyboard(0, jog_mode_left_right ? 0x4F : 0x51); // Down/Right Arrow
+                        vTaskDelay(pdMS_TO_TICKS(40));
+                        ble_mouse_send_keyboard(0, 0);
+                    }
                 } else {
-                    ble_mouse_send_keyboard(0, jog_mode_left_right ? 0x50 : 0x52); // Up/Left Arrow
-                    vTaskDelay(pdMS_TO_TICKS(50));
-                    ble_mouse_send_keyboard(0, 0);
-                }
-            } else {
-                if (now - up_press_start > 400) {
-                    if (now - last_up_repeat > 200) {
-                        last_up_repeat = now;
-                        if (in_settings_menu) {
-                            menu_idx = (menu_idx - 1);
-                            if (menu_idx < 0) menu_idx = 13; // 14 items (0-13)
-                            update_settings_ui();
-                        } else {
-                            ble_mouse_send_keyboard(0, jog_mode_left_right ? 0x50 : 0x52); // Up/Left Arrow
-                            vTaskDelay(pdMS_TO_TICKS(50));
-                            ble_mouse_send_keyboard(0, 0);
-                        }
+                    if (in_settings_menu) {
+                        menu_idx = (menu_idx - 1);
+                        if (menu_idx < 0) menu_idx = 13; // 14 items (0-13)
+                        update_settings_ui();
+                    } else {
+                        // Scroll up: Arrow Up / Arrow Left based on jog mode setting
+                        ble_mouse_send_keyboard(0, jog_mode_left_right ? 0x50 : 0x52); // Up/Left Arrow
+                        vTaskDelay(pdMS_TO_TICKS(40));
+                        ble_mouse_send_keyboard(0, 0);
                     }
                 }
             }
-        } else {
-            up_held = false;
-        }
-
-        static uint32_t dn_press_start = 0;
-        static uint32_t last_dn_repeat = 0;
-        static bool dn_held = false;
-
-        if (dn_state) {
-            if (!dn_held) {
-                dn_held = true;
-                dn_press_start = now;
-                if (in_settings_menu) {
-                    menu_idx = (menu_idx + 1) % 14; // 14 items (0-13)
-                    update_settings_ui();
-                } else {
-                    ble_mouse_send_keyboard(0, jog_mode_left_right ? 0x4F : 0x51); // Down/Right Arrow
-                    vTaskDelay(pdMS_TO_TICKS(50));
-                    ble_mouse_send_keyboard(0, 0);
-                }
-            } else {
-                if (now - dn_press_start > 400) {
-                    if (now - last_dn_repeat > 200) {
-                        last_dn_repeat = now;
-                        if (in_settings_menu) {
-                            menu_idx = (menu_idx + 1) % 14; // 14 items (0-13)
-                            update_settings_ui();
-                        } else {
-                            ble_mouse_send_keyboard(0, jog_mode_left_right ? 0x4F : 0x51); // Down/Right Arrow
-                            vTaskDelay(pdMS_TO_TICKS(50));
-                            ble_mouse_send_keyboard(0, 0);
-                        }
-                    }
-                }
-            }
-        } else {
-            dn_held = false;
+            last_encoder_A = encoder_A;
         }
 
         // IMU Logic
