@@ -636,9 +636,9 @@ static void hardware_input_task(void *param) {
                         lvgl_unlock();
                     }
                 } else {
-                    ble_mouse_send_media(0x40); // AC Back (Bit 6)
+                    ble_mouse_send_report(0, 0, 0, mouse_buttons_state | 0x08); // Mouse Button 4 (Universal Back)
                     vTaskDelay(pdMS_TO_TICKS(50));
-                    ble_mouse_send_media(0x00);
+                    ble_mouse_send_report(0, 0, 0, mouse_buttons_state);
                 }
             }
         } else {
