@@ -609,22 +609,58 @@ static void hardware_input_task(void *param) {
             both_held_triggered = false;
         }
 
-        if (left_pressed != last_left_pressed) {
-            if (left_pressed) {
-                mouse_buttons_state |= 0x01; // Left click down
-            } else {
-                mouse_buttons_state &= ~0x01; // Left click up
+        static uint32_t left_held_start = 0;
+        static bool volume_mode_active = false;
+        static bool l_sw_combo_triggered = false;
+        bool sw_pressed_raw = (gpio_get_level(JOG_SW_PIN) == 0);
+
+        if (left_pressed && sw_pressed_raw) {
+            if (!l_sw_combo_triggered) {
+                l_sw_combo_triggered = true;
+                jog_mode_left_right = !jog_mode_left_right;
+                if (lvgl_lock(-1)) {
+                    lv_label_set_text_fmt(lbl_jog_mode, "MODE: %s", jog_mode_left_right ? "L/R" : "U/D");
+                    lvgl_unlock();
+                }
             }
-            ble_mouse_send_report(0, 0, 0, mouse_buttons_state);
+            left_held_start = 0; // Prevent volume mode
+        } else {
+            l_sw_combo_triggered = false;
+        }
+
+        // Volume knob mode on Left Click Hold (2s)
+        if (left_pressed && !sw_pressed_raw) {
+            if (left_held_start == 0) left_held_start = now;
+            else if (!volume_mode_active && (now - left_held_start > 2000)) {
+                volume_mode_active = true;
+                // Release left click virtually to stop dragging
+                mouse_buttons_state &= ~0x01;
+                ble_mouse_send_report(0, 0, 0, mouse_buttons_state);
+            }
+        } else {
+            left_held_start = 0;
+            volume_mode_active = false;
+        }
+
+        if (left_pressed != last_left_pressed) {
+            if (!volume_mode_active) {
+                if (left_pressed) {
+                    mouse_buttons_state |= 0x01; // Left click down
+                } else {
+                    mouse_buttons_state &= ~0x01; // Left click up
+                }
+                ble_mouse_send_report(0, 0, 0, mouse_buttons_state);
+            }
             last_left_pressed = left_pressed;
         }
+
         // Jog Dial SW Logic (Rest SW is enter / back as before)
-        if (gpio_get_level(JOG_SW_PIN) == 0) {
+        if (sw_pressed_raw) {
             if (!sw_pressed) {
                 sw_pressed = true;
                 sw_press_time = now;
-                // If Clutch is held, immediately flag it as long-pressed to suppress Enter/Back actions
-                sw_long_press_triggered = (gpio_get_level(CLUTCH_PIN) == 0);
+                // If Clutch or Left combo is active, immediately flag as long-pressed to suppress standard Enter/Back actions
+                sw_long_press_triggered = (gpio_get_level(CLUTCH_PIN) == 0) || l_sw_combo_triggered;
             } else if (!sw_long_press_triggered && (now - sw_press_time >= 800)) {
                 sw_long_press_triggered = true;
                 if (in_settings_menu) {
@@ -807,48 +843,8 @@ static void hardware_input_task(void *param) {
                 tap_cd = now + 250;
             }
             
-            // Shake detection: require 3 high-jerk spikes within 300ms to prevent
-            // false triggers from drops, bumps, or placing the board on a table.
-            // jerk threshold 40000 ≈ ~2.5g jolt (16384 = 1g raw at ±2g range)
-            static int shake_count = 0;
-            static uint32_t shake_window_start = 0;
-            if (jerk > 40000) {
-                if (shake_count == 0) shake_window_start = now;
-                if (now - shake_window_start < 350) {
-                    shake_count++;
-                } else {
-                    // Window expired, restart
-                    shake_count = 1;
-                    shake_window_start = now;
-                }
-                if (shake_count >= 3) {
-                    shake_count = 0;
-                    // Shake detected
-                    static uint32_t last_shake = 0;
-                    if (now - last_shake > 2000) { // 2s cooldown prevents accidental re-trigger
-                        jog_mode_left_right = !jog_mode_left_right;
-                        if (lvgl_lock(-1)) {
-                            lv_label_set_text_fmt(lbl_jog_mode, "MODE: %s", jog_mode_left_right ? "L/R" : "U/D");
-                            lvgl_unlock();
-                        }
-                        last_shake = now;
-                    }
-                    if (lvgl_lock(-1)) {
-                        for(int i=0; i<NUM_SPARKLES; i++) {
-                            sparkle_x[i] = 120.0f;
-                            sparkle_y[i] = 160.0f;
-                            sparkle_vx[i] = ((rand() % 200) - 100) / 5.0f;
-                            sparkle_vy[i] = ((rand() % 200) - 100) / 5.0f - 5.0f;
-                            sparkle_life[i] = 20 + (rand() % 30);
-                            lv_obj_clear_flag(sparkles[i], LV_OBJ_FLAG_HIDDEN);
-                        }
-                        lvgl_unlock();
-                    }
-                }
-            } else if (now - shake_window_start > 350) {
-                shake_count = 0; // reset if no jerk for >350ms
-            }
-
+            // Shake detection removed in favor of Left Click + Enter combo
+            
             if (total_taps > 0 && (now - tap_window_start > 400)) {
                 if (total_taps >= 2) {
                     // Double tap -> Page Up
@@ -934,8 +930,8 @@ static void hardware_input_task(void *param) {
                     static uint32_t last_action_time = 0;
                     static bool last_was_cw = false;
 
-                    // safety check: only active when holding BOTH Clutch (CLUTCH_PIN) AND Momentary Button/SW (JOG_SW_PIN)
-                    bool twist_modifier_pressed = (gpio_get_level(CLUTCH_PIN) == 0) && (gpio_get_level(JOG_SW_PIN) == 0);
+                    // safety check: only active when volume mode is active (Left Click held for 2s)
+                    bool twist_modifier_pressed = volume_mode_active;
                     float twist_rate = twist_modifier_pressed ? (cgy / 16.4f) : 0.0f;
                     
                     if (twist_modifier_pressed && fabsf(twist_rate) > 120.0f) { // require >120 deg/sec deliberate twist
