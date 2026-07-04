@@ -74,18 +74,18 @@ static inline float fast_sqrt(float x) { return x * fast_rsqrt(x); }
 #define EXAMPLE_LCD_V_RES 320
 #define EXAMPLE_PIN_NUM_BK_LIGHT 1
 
-// Button & Jog Dial Pins (Waveshare ESP32-S3-Touch-LCD-2 confirmed pins)
-#define CLUTCH_PIN 4      // Push to hover - GPIO 4 (ADC1_CH3 but we use it digital only)
+// Button & Jog Dial Pins (Waveshare ESP32-S3-LCD-2 non-touch board)
+// On this board, the battery divider is internally hardwired to GPIO 4!
+// To avoid conflict, we move the Clutch button to GPIO 6.
+#define CLUTCH_PIN 6      // Push to hover (moved to GPIO 6, connect Clutch wire here!)
 #define BTN_L_PIN 21      // Left Click
 #define JOG_SW_PIN 10     // Jog Switch
 #define JOG_UP_PIN 7      // Jog Up
 #define JOG_DN_PIN 20     // Jog Down
 #define BOOT_BUTTON_PIN 0 // BOOT Button (Menu)
-// Reverted back to GPIO 6 because GPIO 5 caused a screen conflict!
-// You will need to wire the VBAT divider midpoint to GPIO 6 for battery reading to work.
-// Default assumption: 100K/100K -> ratio = 2.0 (set in BAT_DIVIDER_RATIO below)
-#define BAT_ADC_CHANNEL  ADC_CHANNEL_5   // GPIO 6 = ADC1_CH5
-#define BAT_DIVIDER_RATIO 2.0f           // Change to 3.0f if divider is 200K/100K
+// Onboard battery monitoring is hardwired to GPIO 4 (ADC1_CH3)
+#define BAT_ADC_CHANNEL  ADC_CHANNEL_3   // GPIO 4 = ADC1_CH3
+#define BAT_DIVIDER_RATIO 2.0f           // 100K/100K voltage divider on-board
 
 // Power management thresholds
 #define POWER_SAVE_TIMEOUT_MS  30000  // Screen off after 30s still (was 5s)
