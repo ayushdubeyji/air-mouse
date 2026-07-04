@@ -623,8 +623,8 @@ static void hardware_input_task(void *param) {
             if (!sw_pressed) {
                 sw_pressed = true;
                 sw_press_time = now;
-                // If Left Click is held, immediately flag it as long-pressed to suppress Enter/Back actions
-                sw_long_press_triggered = (gpio_get_level(BTN_L_PIN) == 0);
+                // If Clutch is held, immediately flag it as long-pressed to suppress Enter/Back actions
+                sw_long_press_triggered = (gpio_get_level(CLUTCH_PIN) == 0);
             } else if (!sw_long_press_triggered && (now - sw_press_time >= 800)) {
                 sw_long_press_triggered = true;
                 if (in_settings_menu) {
@@ -692,8 +692,11 @@ static void hardware_input_task(void *param) {
         if (encoder_A != last_encoder_A) {
             // Count transitions from 1 to 0 (falling edge of Phase A)
             if (encoder_A == 0) {
-                // If Phase B is high when Phase A falls, it is CW. Otherwise CCW.
-                bool rotate_cw = (encoder_B != 0);
+                static uint32_t last_enc_time = 0;
+                if (now - last_enc_time > 15) { // 15ms debounce to prevent glitchy behavior
+                    last_enc_time = now;
+                    // Inverted CW/CCW logic to fix reverse scrolling
+                    bool rotate_cw = (encoder_B == 0);
 
                 if (rotate_cw) {
                     if (in_settings_menu) {
@@ -715,6 +718,7 @@ static void hardware_input_task(void *param) {
                         ble_mouse_send_keyboard(0, jog_mode_left_right ? 0x50 : 0x52); // Up/Left Arrow
                         vTaskDelay(pdMS_TO_TICKS(40));
                         ble_mouse_send_keyboard(0, 0);
+                    }
                     }
                 }
             }
@@ -930,8 +934,8 @@ static void hardware_input_task(void *param) {
                     static uint32_t last_action_time = 0;
                     static bool last_was_cw = false;
 
-                    // safety check: only active when holding BOTH Left Click (BTN_L_PIN) AND Momentary Button/SW (JOG_SW_PIN)
-                    bool twist_modifier_pressed = (gpio_get_level(BTN_L_PIN) == 0) && (gpio_get_level(JOG_SW_PIN) == 0);
+                    // safety check: only active when holding BOTH Clutch (CLUTCH_PIN) AND Momentary Button/SW (JOG_SW_PIN)
+                    bool twist_modifier_pressed = (gpio_get_level(CLUTCH_PIN) == 0) && (gpio_get_level(JOG_SW_PIN) == 0);
                     float twist_rate = twist_modifier_pressed ? (cgy / 16.4f) : 0.0f;
                     
                     if (twist_modifier_pressed && fabsf(twist_rate) > 120.0f) { // require >120 deg/sec deliberate twist
@@ -1391,7 +1395,10 @@ void app_main(void) {
     disp_drv.hor_res = 240; disp_drv.ver_res = 320;
     disp_drv.flush_cb = example_lvgl_flush_cb;
     disp_drv.draw_buf = &draw_buf;
+    disp_drv.sw_rotate = 1; // Enable software rotation for landscape mode
     lv_disp_drv_register(&disp_drv);
+    
+    apply_display_rotation(); // Apply the saved rotation on boot
 
     const esp_timer_create_args_t lvgl_tick_timer_args = { .callback=&example_increase_lvgl_tick, .name="lvgl_tick" };
     esp_timer_handle_t lvgl_tick_timer;
