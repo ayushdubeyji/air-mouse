@@ -843,7 +843,44 @@ static void hardware_input_task(void *param) {
                 tap_cd = now + 250;
             }
             
-            // Shake detection removed in favor of Left Click + Enter combo
+            // Shake detection: require 3 high-jerk spikes within 300ms
+            // Triggers AC Home (Go to Home Screen)
+            static int shake_count = 0;
+            static uint32_t shake_window_start = 0;
+            if (jerk > 40000) {
+                if (shake_count == 0) shake_window_start = now;
+                if (now - shake_window_start < 350) {
+                    shake_count++;
+                } else {
+                    shake_count = 1;
+                    shake_window_start = now;
+                }
+                if (shake_count >= 3) {
+                    shake_count = 0;
+                    static uint32_t last_shake = 0;
+                    if (now - last_shake > 2000) { // 2s cooldown
+                        last_shake = now;
+                        ble_mouse_send_media(0x80); // AC Home (Bit 7)
+                        vTaskDelay(pdMS_TO_TICKS(50));
+                        ble_mouse_send_media(0x00);
+                        
+                        // Sparkle feedback
+                        if (lvgl_lock(-1)) {
+                            for(int i=0; i<NUM_SPARKLES; i++) {
+                                sparkle_x[i] = 120.0f;
+                                sparkle_y[i] = 160.0f;
+                                sparkle_vx[i] = ((rand() % 200) - 100) / 5.0f;
+                                sparkle_vy[i] = ((rand() % 200) - 100) / 5.0f - 5.0f;
+                                sparkle_life[i] = 20 + (rand() % 30);
+                                lv_obj_clear_flag(sparkles[i], LV_OBJ_FLAG_HIDDEN);
+                            }
+                            lvgl_unlock();
+                        }
+                    }
+                }
+            } else if (now - shake_window_start > 350) {
+                shake_count = 0; // reset if no jerk for >350ms
+            }
             
             if (total_taps > 0 && (now - tap_window_start > 400)) {
                 if (total_taps >= 2) {

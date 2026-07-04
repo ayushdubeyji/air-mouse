@@ -91,7 +91,7 @@ static const uint8_t hid_report_map[] = {
     0x15, 0x00,       //   Logical Minimum (0)
     0x25, 0x01,       //   Logical Maximum (1)
     0x75, 0x01,       //   Report Size (1)
-    0x95, 0x07,       //   Report Count (7)
+    0x95, 0x08,       //   Report Count (8)
     0x09, 0xE9,       //   Usage (Volume Increment)
     0x09, 0xEA,       //   Usage (Volume Decrement)
     0x09, 0xE2,       //   Usage (Mute)
@@ -99,10 +99,8 @@ static const uint8_t hid_report_map[] = {
     0x09, 0xB5,       //   Usage (Scan Next Track)
     0x09, 0xB6,       //   Usage (Scan Previous Track)
     0x0A, 0x24, 0x02, //   Usage (AC Back)
+    0x0A, 0x23, 0x02, //   Usage (AC Home)
     0x81, 0x02,       //   Input (Data, Variable, Absolute)
-    0x95, 0x01,       //   Report Count (1)
-    0x75, 0x01,       //   Report Size (1)
-    0x81, 0x01,       //   Input (Constant) reserved bit
     0xC0              // End Collection
 };
 
