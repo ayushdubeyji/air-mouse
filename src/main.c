@@ -115,6 +115,7 @@ static int sparkle_life[NUM_SPARKLES];
 
 // State Variables
 static bool is_screen_on = true;
+static bool screen_manually_off = false;
 static bool in_settings_menu = false;
 static bool gyro_clutch_active = false;
 static bool is_calibrating = true; // Auto-calibrate on boot to fix sliding offset
@@ -560,7 +561,11 @@ static void hardware_input_task(void *param) {
                     }
                 }
             } else if (boot_clicks == 3) {
-                toggle_screen(!is_screen_on);
+                screen_manually_off = !screen_manually_off;
+                toggle_screen(!screen_manually_off);
+                if (screen_manually_off) {
+                    screen_saver_on = false;
+                }
             }
             boot_clicks = 0;
         }
@@ -568,6 +573,15 @@ static void hardware_input_task(void *param) {
         // Left Click and Clutch Logic
         bool clutch_pressed = (gpio_get_level(CLUTCH_PIN) == 0);
         bool left_pressed = (gpio_get_level(BTN_L_PIN) == 0);
+        bool sw_pressed_raw = (gpio_get_level(JOG_SW_PIN) == 0);
+        bool boot_pressed_raw = (gpio_get_level(BOOT_BUTTON_PIN) == 0);
+
+        if (screen_manually_off && (clutch_pressed || left_pressed || sw_pressed_raw || boot_pressed_raw)) {
+            screen_manually_off = false;
+            screen_saver_on = false;
+            toggle_screen(true);
+            last_motion_ms = now;
+        }
 
         static bool last_clutch_raw = false;
         if (clutch_pressed) {
@@ -612,7 +626,7 @@ static void hardware_input_task(void *param) {
         static uint32_t left_held_start = 0;
         static bool volume_mode_active = false;
         static bool l_sw_combo_triggered = false;
-        bool sw_pressed_raw = (gpio_get_level(JOG_SW_PIN) == 0);
+        // sw_pressed_raw already declared above
 
         if (left_pressed && sw_pressed_raw) {
             if (!l_sw_combo_triggered) {
@@ -720,45 +734,62 @@ static void hardware_input_task(void *param) {
             }
         }
 
-        // Hollow Shaft Rotary Encoder (3-Pin) Logic on JOG_UP_PIN (A) and JOG_DN_PIN (B)
-        static int last_encoder_A = 1;
+        // Robust 1-to-1 State Machine Quadrature Encoder Logic on JOG_UP_PIN (A) and JOG_DN_PIN (B)
+        static uint8_t last_stable_state = 3;
+        static uint8_t intermediate_state = 3;
+        static uint32_t last_scroll_time = 0;
+
         int encoder_A = gpio_get_level(JOG_UP_PIN); // GPIO 7 (Phase A)
         int encoder_B = gpio_get_level(JOG_DN_PIN); // GPIO 20 (Phase B)
+        uint8_t current_state = (encoder_A << 1) | encoder_B;
 
-        if (encoder_A != last_encoder_A) {
-            // Count transitions from 1 to 0 (falling edge of Phase A)
-            if (encoder_A == 0) {
-                static uint32_t last_enc_time = 0;
-                if (now - last_enc_time > 15) { // 15ms debounce to prevent glitchy behavior
-                    last_enc_time = now;
-                    // Inverted CW/CCW logic to fix reverse scrolling
-                    bool rotate_cw = (encoder_B == 0);
+        if (current_state != intermediate_state) {
+            if (current_state == 0 || current_state == 3) {
+                // Reached a stable state (00 or 11)
+                if (current_state != last_stable_state) {
+                    bool trigger = false;
+                    bool rotate_cw = false;
 
-                if (rotate_cw) {
-                    if (in_settings_menu) {
-                        menu_idx = (menu_idx + 1) % 14;
-                        update_settings_ui();
-                    } else {
-                        // Scroll down: Arrow Down / Arrow Right based on jog mode setting
-                        ble_mouse_send_keyboard(0, jog_mode_left_right ? 0x4F : 0x51); // Down/Right Arrow
-                        vTaskDelay(pdMS_TO_TICKS(40));
-                        ble_mouse_send_keyboard(0, 0);
+                    if (current_state == 0) {
+                        if (intermediate_state == 1) { trigger = true; rotate_cw = true; }
+                        else if (intermediate_state == 2) { trigger = true; rotate_cw = false; }
+                    } else if (current_state == 3) {
+                        if (intermediate_state == 2) { trigger = true; rotate_cw = true; }
+                        else if (intermediate_state == 1) { trigger = true; rotate_cw = false; }
                     }
-                } else {
-                    if (in_settings_menu) {
-                        menu_idx = (menu_idx - 1);
-                        if (menu_idx < 0) menu_idx = 13; // 14 items (0-13)
-                        update_settings_ui();
-                    } else {
-                        // Scroll up: Arrow Up / Arrow Left based on jog mode setting
-                        ble_mouse_send_keyboard(0, jog_mode_left_right ? 0x50 : 0x52); // Up/Left Arrow
-                        vTaskDelay(pdMS_TO_TICKS(40));
-                        ble_mouse_send_keyboard(0, 0);
+
+                    if (trigger && (now - last_scroll_time > 20)) { // 20ms cooldown
+                        last_scroll_time = now;
+                        // Invert CW/CCW direction to match user's previous preference
+                        rotate_cw = !rotate_cw;
+
+                        if (rotate_cw) {
+                            if (in_settings_menu) {
+                                menu_idx = (menu_idx + 1) % 14;
+                                update_settings_ui();
+                            } else {
+                                // Scroll down: Arrow Down / Arrow Right based on jog mode setting
+                                ble_mouse_send_keyboard(0, jog_mode_left_right ? 0x4F : 0x51); // Down/Right Arrow
+                                vTaskDelay(pdMS_TO_TICKS(40));
+                                ble_mouse_send_keyboard(0, 0);
+                            }
+                        } else {
+                            if (in_settings_menu) {
+                                menu_idx = (menu_idx - 1);
+                                if (menu_idx < 0) menu_idx = 13;
+                                update_settings_ui();
+                            } else {
+                                // Scroll up: Arrow Up / Arrow Left based on jog mode setting
+                                ble_mouse_send_keyboard(0, jog_mode_left_right ? 0x50 : 0x52); // Up/Left Arrow
+                                vTaskDelay(pdMS_TO_TICKS(40));
+                                ble_mouse_send_keyboard(0, 0);
+                            }
+                        }
                     }
-                    }
+                    last_stable_state = current_state;
                 }
             }
-            last_encoder_A = encoder_A;
+            intermediate_state = current_state;
         }
 
         // IMU Logic
@@ -804,7 +835,7 @@ static void hardware_input_task(void *param) {
             if (motion_detected) {
                 last_motion_ms = now;
                 last_accel_mag = accel_mag;
-                if (screen_saver_on) {
+                if (screen_saver_on && !screen_manually_off) {
                     screen_saver_on = false;
                     toggle_screen(true); // Wake the screen
                 }
@@ -824,7 +855,7 @@ static void hardware_input_task(void *param) {
                     esp_sleep_enable_ext0_wakeup(BOOT_BUTTON_PIN, 0); // wake on BOOT low
                     esp_deep_sleep_start();
                     // Never returns here
-                } else if (still_ms > POWER_SAVE_TIMEOUT_MS && !screen_saver_on) {
+                } else if (still_ms > POWER_SAVE_TIMEOUT_MS && !screen_saver_on && !screen_manually_off) {
                     screen_saver_on = true;
                     toggle_screen(false); // Screen off to save power
                 }
@@ -969,7 +1000,18 @@ static void hardware_input_task(void *param) {
 
                     // safety check: only active when volume mode is active (Left Click held for 2s)
                     bool twist_modifier_pressed = volume_mode_active;
-                    float twist_rate = twist_modifier_pressed ? (cgy / 16.4f) : 0.0f;
+                    
+                    float raw_twist = 0.0f;
+                    if (cfg_orientation == 1) {      // 0 deg (portrait)
+                        raw_twist = cgy;
+                    } else if (cfg_orientation == 3) { // 180 deg (portrait inverted)
+                        raw_twist = -cgy;
+                    } else if (cfg_orientation == 0) { // 90 deg anticlockwise (landscape)
+                        raw_twist = cgx;
+                    } else if (cfg_orientation == 2) { // 90 deg clockwise (landscape inverted)
+                        raw_twist = -cgx;
+                    }
+                    float twist_rate = twist_modifier_pressed ? (raw_twist / 16.4f) : 0.0f;
                     
                     if (twist_modifier_pressed && fabsf(twist_rate) > 120.0f) { // require >120 deg/sec deliberate twist
                         bool is_cw = (twist_rate > 0);
