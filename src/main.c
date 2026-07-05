@@ -83,9 +83,9 @@ static inline float fast_sqrt(float x) { return x * fast_rsqrt(x); }
 #define JOG_UP_PIN 7      // Jog Up
 #define JOG_DN_PIN 20     // Jog Down
 #define BOOT_BUTTON_PIN 0 // BOOT Button (Menu)
-// Onboard battery monitoring is hardwired to GPIO 4 (ADC1_CH3)
-#define BAT_ADC_CHANNEL  ADC_CHANNEL_3   // GPIO 4 = ADC1_CH3
-#define BAT_DIVIDER_RATIO 2.0f           // 100K/100K voltage divider on-board
+// Onboard battery monitoring is hardwired to GPIO 5 (ADC1_CH4) on Waveshare ESP32-S3-LCD-1.47
+#define BAT_ADC_CHANNEL  ADC_CHANNEL_4   // GPIO 5 = ADC1_CH4
+#define BAT_DIVIDER_RATIO 3.0f           // 200K/100K voltage divider on-board
 
 // Power management thresholds
 #define POWER_SAVE_TIMEOUT_MS  30000  // Screen off after 30s still (was 5s)
