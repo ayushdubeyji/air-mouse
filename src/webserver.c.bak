@@ -1,0 +1,299 @@
+#include <esp_wifi.h>
+#include <esp_event.h>
+#include <esp_log.h>
+#include <esp_system.h>
+#include <sys/param.h>
+#include "esp_netif.h"
+#include "esp_http_server.h"
+#include "esp_camera.h"
+#include "webserver.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+// ─── Camera DVP pins (Waveshare ESP32-S3-Touch-LCD-2 schematic) ───
+#define CAM_PIN_PWDN   8
+#define CAM_PIN_RESET  -1    // software reset
+#define CAM_PIN_XCLK   13
+#define CAM_PIN_SIOD   3
+#define CAM_PIN_SIOC   5
+#define CAM_PIN_D7     14
+#define CAM_PIN_D6     15
+#define CAM_PIN_D5     16
+#define CAM_PIN_D4     18
+#define CAM_PIN_D3     20
+#define CAM_PIN_D2     22
+#define CAM_PIN_D1     7
+#define CAM_PIN_D0     19
+#define CAM_PIN_VSYNC  9
+#define CAM_PIN_HREF   10
+#define CAM_PIN_PCLK   17
+
+// Exported settings (defined in main.c)
+extern int  cfg_twist_axis;
+extern int  cfg_twist_gesture;
+extern int  cfg_brightness;
+extern float cfg_sensitivity;
+extern float cfg_deadzone;
+extern bool cfg_invert_x;
+extern bool cfg_invert_y;
+extern bool cfg_swap_xy;
+
+bool cam_enabled  = true;
+int  cam_rotation = 0;
+
+static bool            wifi_enabled = false;
+static httpd_handle_t  server       = NULL;
+static bool            wifi_inited  = false;    // esp_wifi_init done once
+static bool            cam_inited   = false;    // esp_camera_init done once
+
+// Flag set by disable_handler; consumed by a background task to avoid
+// stopping httpd from inside its own callback (would deadlock).
+static volatile bool   pending_wifi_disable = false;
+
+static const char *TAG = "WEB_SRV";
+
+// ─── Stream handler ───────────────────────────────────────────────
+static esp_err_t stream_handler(httpd_req_t *req) {
+    camera_fb_t *fb  = NULL;
+    esp_err_t    res = ESP_OK;
+    char         part_buf[128];
+
+    res = httpd_resp_set_type(req,
+          "multipart/x-mixed-replace;boundary=123456789000000000000987654321");
+    if (res != ESP_OK) return res;
+
+    while (true) {
+        if (!cam_enabled || !wifi_enabled || !cam_inited) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+        fb = esp_camera_fb_get();
+        if (!fb) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+
+        size_t hlen = snprintf(part_buf, sizeof(part_buf),
+            "\r\n--123456789000000000000987654321\r\n"
+            "Content-Type: image/jpeg\r\n"
+            "Content-Length: %u\r\n\r\n", (unsigned)fb->len);
+        res = httpd_resp_send_chunk(req, part_buf, hlen);
+        if (res == ESP_OK)
+            res = httpd_resp_send_chunk(req, (const char *)fb->buf, fb->len);
+        esp_camera_fb_return(fb);
+        if (res != ESP_OK) break;
+    }
+    return res;
+}
+
+// ─── Index / dashboard ───────────────────────────────────────────
+static esp_err_t index_handler(httpd_req_t *req) {
+    char html[3000];
+    snprintf(html, sizeof(html),
+        "<!DOCTYPE html><html><head>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<title>AirMouse Dashboard</title>"
+        "<style>"
+        "body{font-family:sans-serif;text-align:center;background:#111;color:#eee;margin:0;padding:10px}"
+        "h2{color:#0af}"
+        "img{max-width:100%%;border-radius:8px;transition:transform .3s}"
+        ".card{background:#222;padding:16px;border-radius:10px;margin:10px auto;max-width:420px}"
+        "label{display:block;margin:8px 0 2px;color:#aaa;font-size:.9em}"
+        "select,button{padding:8px;width:100%%;box-sizing:border-box;background:#333;color:#fff;border:1px solid #555;border-radius:6px;margin-top:4px}"
+        "button{background:#b00;cursor:pointer}"
+        "button:hover{background:#d00}"
+        "</style>"
+        "<script>"
+        "function update(){"
+        "  var rot=document.getElementById('rot').value;"
+        "  document.getElementById('stream').style.transform='rotate('+rot+'deg)';"
+        "  fetch('/set?axis='+document.getElementById('axis').value"
+        "      +'&cam='+document.getElementById('cam').value"
+        "      +'&rot='+rot);"
+        "}"
+        "function disableWifi(){"
+        "  if(!confirm('Disable Wi-Fi AP? BLE mouse will then connect.'))return;"
+        "  fetch('/disable').then(()=>{"
+        "    document.body.innerHTML='<h2 style=color:#0af>Wi-Fi AP stopped.</h2>"
+        "    <p>Double-click the BOOT button to re-enable.</p>';"
+        "  });"
+        "}"
+        "</script></head><body>"
+        "<h2>Air Mouse Dashboard</h2>"
+        "<div class='card'>"
+        "<img id='stream' src='/stream'>"
+        "</div>"
+        "<div class='card'>"
+        "<label>Camera</label>"
+        "<select id='cam' onchange='update()'>"
+        "<option value='1'%s>On</option><option value='0'%s>Off</option></select>"
+        "<label>Rotation</label>"
+        "<select id='rot' onchange='update()'>"
+        "<option value='0'%s>0&deg;</option>"
+        "<option value='90'%s>90&deg;</option>"
+        "<option value='180'%s>180&deg;</option>"
+        "<option value='270'%s>270&deg;</option></select>"
+        "<label>Knob Axis</label>"
+        "<select id='axis' onchange='update()'>"
+        "<option value='0'%s>Z+ (default)</option>"
+        "<option value='1'%s>Z-</option>"
+        "<option value='2'%s>Y+</option>"
+        "<option value='3'%s>Y-</option>"
+        "<option value='4'%s>X+</option>"
+        "<option value='5'%s>X-</option>"
+        "</select>"
+        "</div>"
+        "<div class='card'>"
+        "<button onclick='disableWifi()'>Disable Wi-Fi AP &rarr; Enable BLE Mouse</button>"
+        "</div></body></html>",
+        // cam
+        cam_enabled  ? " selected" : "", !cam_enabled ? " selected" : "",
+        // rotation
+        cam_rotation==0   ? " selected" : "",
+        cam_rotation==90  ? " selected" : "",
+        cam_rotation==180 ? " selected" : "",
+        cam_rotation==270 ? " selected" : "",
+        // axis
+        cfg_twist_axis==0 ? " selected" : "",
+        cfg_twist_axis==1 ? " selected" : "",
+        cfg_twist_axis==2 ? " selected" : "",
+        cfg_twist_axis==3 ? " selected" : "",
+        cfg_twist_axis==4 ? " selected" : "",
+        cfg_twist_axis==5 ? " selected" : ""
+    );
+    httpd_resp_send(req, html, HTTPD_RESP_USE_STRLEN);
+    return ESP_OK;
+}
+
+// ─── Set handler ─────────────────────────────────────────────────
+static esp_err_t set_handler(httpd_req_t *req) {
+    char buf[120];
+    if (httpd_req_get_url_query_str(req, buf, sizeof(buf)) == ESP_OK) {
+        char p[16];
+        if (httpd_query_key_value(buf, "axis", p, sizeof(p)) == ESP_OK) cfg_twist_axis = atoi(p);
+        if (httpd_query_key_value(buf, "cam",  p, sizeof(p)) == ESP_OK) cam_enabled    = (atoi(p) != 0);
+        if (httpd_query_key_value(buf, "rot",  p, sizeof(p)) == ESP_OK) cam_rotation   = atoi(p);
+    }
+    httpd_resp_send(req, "OK", 2);
+    return ESP_OK;
+}
+
+// ─── Disable handler — sets flag, real stop done in bg task ──────
+static esp_err_t disable_handler(httpd_req_t *req) {
+    const char *msg = "Stopping Wi-Fi AP...";
+    httpd_resp_send(req, msg, strlen(msg));
+    // Signal a deferred disable — cannot stop httpd from its own callback
+    pending_wifi_disable = true;
+    return ESP_OK;
+}
+
+// Background task: watches pending_wifi_disable flag
+static void wifi_ctrl_task(void *arg) {
+    while (true) {
+        if (pending_wifi_disable) {
+            pending_wifi_disable = false;
+            vTaskDelay(pdMS_TO_TICKS(200)); // let response flush
+            toggle_wifi_ap(false);
+        }
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+// ─── Toggle WiFi AP ──────────────────────────────────────────────
+void toggle_wifi_ap(bool on) {
+    if (on == wifi_enabled) return;
+
+    if (on) {
+        ESP_LOGI(TAG, "Starting Wi-Fi AP...");
+        wifi_config_t wifi_config = {
+            .ap = {
+                .ssid           = "AirMouse_AP",
+                .ssid_len       = 11,
+                .password       = "12345678",
+                .max_connection = 4,
+                .authmode       = WIFI_AUTH_WPA2_PSK,
+                .beacon_interval= 200,   // longer beacons = more BLE airtime
+            }
+        };
+        ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
+        ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
+        ESP_ERROR_CHECK(esp_wifi_start());
+
+        httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+        config.stack_size = 8192;
+        config.lru_purge_enable = true;
+        if (httpd_start(&server, &config) == ESP_OK) {
+            httpd_uri_t u;
+            u.method   = HTTP_GET; u.user_ctx = NULL;
+            u.uri = "/";        u.handler = index_handler;  httpd_register_uri_handler(server, &u);
+            u.uri = "/stream";  u.handler = stream_handler; httpd_register_uri_handler(server, &u);
+            u.uri = "/set";     u.handler = set_handler;    httpd_register_uri_handler(server, &u);
+            u.uri = "/disable"; u.handler = disable_handler; httpd_register_uri_handler(server, &u);
+        }
+        wifi_enabled = true;
+        ESP_LOGI(TAG, "Wi-Fi AP started. SSID=AirMouse_AP IP=192.168.4.1");
+    } else {
+        ESP_LOGI(TAG, "Stopping Wi-Fi AP...");
+        if (server) { httpd_stop(server); server = NULL; }
+        esp_wifi_stop();
+        wifi_enabled = false;
+        ESP_LOGI(TAG, "Wi-Fi AP stopped. BLE will now get full radio.");
+    }
+}
+
+bool is_wifi_ap_enabled(void) {
+    return wifi_enabled;
+}
+
+// ─── Entry point (called once from app_main) ─────────────────────
+void start_webserver(void) {
+    // 1. Netif (must happen before wifi_init)
+    esp_netif_init();
+    esp_netif_create_default_wifi_ap();   // creates the AP interface object
+
+    // 2. WiFi driver init (once)
+    if (!wifi_inited) {
+        wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+        ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+        wifi_inited = true;
+    }
+
+    // 3. Camera init (once, independent of WiFi)
+    if (!cam_inited) {
+        camera_config_t cam_cfg = {
+            .pin_pwdn        = CAM_PIN_PWDN,
+            .pin_reset       = CAM_PIN_RESET,
+            .pin_xclk        = CAM_PIN_XCLK,
+            .pin_sscb_sda    = CAM_PIN_SIOD,
+            .pin_sscb_scl    = CAM_PIN_SIOC,
+            .pin_d7 = CAM_PIN_D7, .pin_d6 = CAM_PIN_D6,
+            .pin_d5 = CAM_PIN_D5, .pin_d4 = CAM_PIN_D4,
+            .pin_d3 = CAM_PIN_D3, .pin_d2 = CAM_PIN_D2,
+            .pin_d1 = CAM_PIN_D1, .pin_d0 = CAM_PIN_D0,
+            .pin_vsync       = CAM_PIN_VSYNC,
+            .pin_href        = CAM_PIN_HREF,
+            .pin_pclk        = CAM_PIN_PCLK,
+            .xclk_freq_hz    = 20000000,
+            .ledc_timer      = LEDC_TIMER_1,
+            .ledc_channel    = LEDC_CHANNEL_1,
+            .pixel_format    = PIXFORMAT_JPEG,
+            .frame_size      = FRAMESIZE_VGA,
+            .jpeg_quality    = 12,
+            .fb_count        = 2,
+        };
+        if (esp_camera_init(&cam_cfg) == ESP_OK) {
+            cam_inited = true;
+            sensor_t *s = esp_camera_sensor_get();
+            if (s) {
+                s->set_saturation(s, 2);    // vivid colors
+                s->set_contrast(s, 1);       // slight contrast boost
+            }
+            ESP_LOGI(TAG, "Camera init OK");
+        } else {
+            ESP_LOGE(TAG, "Camera init FAILED — stream will show blank");
+        }
+    }
+
+    // 4. Background task for deferred WiFi disable
+    xTaskCreate(wifi_ctrl_task, "wifi_ctrl", 2048, NULL, 3, NULL);
+
+    // 5. Start AP + HTTP server
+    toggle_wifi_ap(true);
+}

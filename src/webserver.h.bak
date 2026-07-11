@@ -1,0 +1,6 @@
+#pragma once
+#include <stdbool.h>
+
+void start_webserver(void);
+void toggle_wifi_ap(bool on);
+bool is_wifi_ap_enabled(void);

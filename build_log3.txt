@@ -1,0 +1,36 @@
+Processing esp32-s3-lcd-2 (platform: espressif32; board: esp32-s3-devkitc-1; framework: espidf)
+--------------------------------------------------------------------------------
+Verbose mode can be enabled via `-v, --verbose` option
+CONFIGURATION: https://docs.platformio.org/page/boards/espressif32/esp32-s3-devkitc-1.html
+PLATFORM: Espressif 32 (55.3.39+develop.sha.4752c1e) > Espressif ESP32-S3-DevKitC-1-N8 (8 MB QD, No PSRAM)
+HARDWARE: ESP32S3 240MHz, 320KB RAM, 8MB Flash
+DEBUG: Current (esp-builtin) On-board (esp-builtin) External (cmsis-dap, esp-bridge, esp-prog, esp-prog-2, iot-bus-jtag, jlink, minimodule, olimex-arm-usb-ocd, olimex-arm-usb-ocd-h, olimex-arm-usb-tiny-h, olimex-jtag-tiny, tumpa)
+PACKAGES: 
+ - contrib-piohome @ 3.4.4 
+ - framework-espidf @ 3.50504.0 (5.5.4) 
+ - tool-cmake @ 4.0.3 
+ - tool-esp-rom-elfs @ 2024.10.11 
+ - tool-esptoolpy @ 5.3.0 
+ - tool-ninja @ 1.13.1 
+ - tool-scons @ 4.40801.0 (4.8.1) 
+ - tool-xtensa-esp-elf-gdb @ 17.1.0+20260402 
+ - toolchain-xtensa-esp-elf @ 14.2.0+20260121
+Using Python 3.11.15 environment at: C:\Users\dell\.platformio\penv\.espidf-5.5.4
+Reading CMake configuration...
+LDF: Library Dependency Finder -> https://bit.ly/configure-pio-ldf
+LDF Modes: Finder ~ chain, Compatibility ~ soft
+Found 0 compatible libraries
+Scanning dependencies...
+No dependencies
+Building in release mode
+Compiling .pio\build\esp32-s3-lcd-2\src\main.c.o
+Archiving .pio\build\esp32-s3-lcd-2\esp-idf\app_trace\libapp_trace.a
+Archiving .pio\build\esp32-s3-lcd-2\esp-idf\app_update\libapp_update.a
+Archiving .pio\build\esp32-s3-lcd-2\esp-idf\bootloader_support\libbootloader_support.a
+src/main.c: In function 'hardware_input_task':
+src/main.c:1682:1: error: expected declaration or statement at end of input
+ 1682 | }
+      | ^
+Archiving .pio\build\esp32-s3-lcd-2\esp-idf\bt\libbt.a
+*** [.pio\build\esp32-s3-lcd-2\src\main.c.o] Error 1
+========================= [FAILED] Took 14.82 seconds =========================

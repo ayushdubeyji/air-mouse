@@ -19,7 +19,7 @@ static uint16_t report_handle_keyboard = 0;
 static uint16_t report_handle_media = 0;
 
 static int active_device_id = 1;
-static char device_name[32] = "S3-Air-Mouse-D1";
+static char device_name[32] = "AirMouse_BLE_V2";
 
 static const uint8_t hid_report_map[] = {
     // Mouse Report (ID 1)
@@ -310,6 +310,9 @@ static void ble_mouse_advertise(void) {
     memset(&adv_params, 0, sizeof adv_params);
     adv_params.conn_mode = BLE_GAP_CONN_MODE_UND;
     adv_params.disc_mode = BLE_GAP_DISC_MODE_GEN;
+    // 200ms intervals give WiFi coex enough airtime slots
+    adv_params.itvl_min = BLE_GAP_ADV_ITVL_MS(200);
+    adv_params.itvl_max = BLE_GAP_ADV_ITVL_MS(250);
     rc = ble_gap_adv_start(BLE_OWN_ADDR_PUBLIC, NULL, BLE_HS_FOREVER, &adv_params, ble_mouse_gap_event, NULL);
     if (rc != 0) {
         ESP_LOGE(TAG, "error enabling advertisement; rc=%d", rc);
@@ -335,6 +338,10 @@ static int ble_mouse_gap_event(struct ble_gap_event *event, void *arg) {
             break;
 
         case BLE_GAP_EVENT_ADV_COMPLETE:
+            ESP_LOGI(TAG, "ADV Complete reason: %d", event->adv_complete.reason);
+            if (event->adv_complete.reason != 0) {
+                vTaskDelay(pdMS_TO_TICKS(1000));
+            }
             ble_mouse_advertise();
             break;
 

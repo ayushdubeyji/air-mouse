@@ -22,7 +22,13 @@
 #include <stdlib.h>
 #include "nvs_flash.h"
 #include "nvs.h"
+#include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
 #include "earth_texture.h"
+
+// Set to 1 when physical display is connected and LVGL should run
+// Set to 0 when display is detached — skips all LVGL/display code to prevent boot crash
+#define DISPLAY_ACTIVE 0
 
 // Fast atan2 approximation
 static inline float fast_atan2(float y, float x) {
@@ -59,39 +65,52 @@ static inline float fast_rsqrt(float x) {
 static inline float fast_sqrt(float x) { return x * fast_rsqrt(x); }
 
 
-#define EXAMPLE_PIN_NUM_SCLK 39
-#define EXAMPLE_PIN_NUM_MOSI 38
-#define EXAMPLE_PIN_NUM_MISO 40  // SD card MISO shares SPI2 bus
-#define EXAMPLE_SPI_HOST SPI2_HOST
+// ── External 2.8" ST7789 (240×320) wired to outer GPIO header ──
+// Internal LCD is dead — all old internal SPI pins (38,39,42,45,1) are unused.
+// New wiring (see connection guide below):
+//   SCK  → IO18   MOSI → IO17   DC  → IO16
+//   CS   → IO4    RST  → IO6    BL  → IO21 (PWM) or 3.3V
+#define EXAMPLE_PIN_NUM_SCLK       18
+#define EXAMPLE_PIN_NUM_MOSI       17
+#define EXAMPLE_PIN_NUM_MISO       -1   // ST7789 is write-only
+#define EXAMPLE_SPI_HOST           SPI3_HOST  // SPI2 was tied to internal bus; use SPI3
 
-// SD Card pins — shared SPI2 bus with LCD (different CS)
-#define SD_MOSI_PIN  38  // Shared with LCD MOSI (NLSD0MOSI from schematic)
-#define SD_MISO_PIN  40  // NLSD0MISO
-#define SD_CLK_PIN   39  // Shared with LCD SCLK (NLSD0SCLK)
-#define SD_CS_PIN    41  // NLSD0CS — separate from LCD CS (GPIO 45)
+// SD Card: moved to its own SPI2 bus on free outer pins (or disable if not needed)
+// SD is DISABLED — its old pins (38,39,40,41) are on the internal bus.
+// If you need SD, rewire it to other outer pins and re-enable below.
+#define SD_MOSI_PIN  -1  // SD disabled (internal bus dead)
+#define SD_MISO_PIN  -1
+#define SD_CLK_PIN   -1
+#define SD_CS_PIN    -1
+
 #define EXAMPLE_I2C_NUM 1
 #define EXAMPLE_PIN_NUM_I2C_SDA 48
 #define EXAMPLE_PIN_NUM_I2C_SCL 47
-#define EXAMPLE_LCD_PIXEL_CLOCK_HZ (60 * 1000 * 1000) // Pushed to 60MHz for high FPS
-#define EXAMPLE_PIN_NUM_LCD_DC 42
-#define EXAMPLE_PIN_NUM_LCD_RST -1
-#define EXAMPLE_PIN_NUM_LCD_CS 45
-#define EXAMPLE_LCD_H_RES 240
-#define EXAMPLE_LCD_V_RES 320
-#define EXAMPLE_PIN_NUM_BK_LIGHT 1
+#define EXAMPLE_LCD_PIXEL_CLOCK_HZ (60 * 1000 * 1000) // 60MHz (short wires)
+#define EXAMPLE_PIN_NUM_LCD_DC     16
+#define EXAMPLE_PIN_NUM_LCD_RST    6    // Adjusted reset to GPIO 6
+#define EXAMPLE_PIN_NUM_LCD_CS     4    // Adjusted CS to GPIO 4
+#define EXAMPLE_LCD_H_RES          240
+#define EXAMPLE_LCD_V_RES          320
+#define EXAMPLE_PIN_NUM_BK_LIGHT   21   // Outer IO21 — LEDC PWM backlight
+// LEDC channel for backlight PWM brightness control
+#define BK_LIGHT_LEDC_CH    LEDC_CHANNEL_0
+#define BK_LIGHT_LEDC_TIMER LEDC_TIMER_0
+#define CHARGER_STAT_PIN   45 // Moved from 9 (Camera VSYNC conflict)
 
 // Button & Jog Dial Pins (Waveshare ESP32-S3-LCD-2 non-touch board)
-// On this board, the battery divider is internally hardwired to GPIO 4!
-// To avoid conflict, we move the Clutch button to GPIO 6.
-#define CLUTCH_PIN 6      // Push to hover (moved to GPIO 6, connect Clutch wire here!)
+// On this board, the battery divider is internally hardwired to GPIO 5!
+// To avoid conflict, we move the Clutch button to GPIO 2.
+#define CLUTCH_PIN 2      // Push to hover (moved to GPIO 2, connect Clutch wire here!)
 #define BTN_L_PIN 21      // Left Click
-#define JOG_SW_PIN 10     // Jog Switch
-#define JOG_UP_PIN 7      // Jog Up
-#define JOG_DN_PIN 20     // Jog Down
+#define JOG_SW_PIN 11     // Jog Switch (Moved from 10 to avoid Camera HREF)
+#define JOG_UP_PIN 12     // Jog Up (Moved from 7 to avoid Camera D1)
+#define JOG_DN_PIN 46     // Jog Down (Moved from 20 to avoid Camera D3)
 #define BOOT_BUTTON_PIN 0 // BOOT Button (Menu)
-// Onboard battery monitoring is hardwired to GPIO 5 (ADC1_CH4) on Waveshare ESP32-S3-LCD-1.47
+// Battery ADC: voltage divider 200K+100K, VBAT = vadc * 3.0
+// GPIO 5 = ADC1_CH4
 #define BAT_ADC_CHANNEL  ADC_CHANNEL_4   // GPIO 5 = ADC1_CH4
-#define BAT_DIVIDER_RATIO 3.0f           // 200K/100K voltage divider on-board
+#define BAT_DIVIDER_RATIO 3.0f           // (200K+100K)/100K = *3
 
 // Power management thresholds
 #define POWER_SAVE_TIMEOUT_MS  30000  // Screen off after 30s still (was 5s)
@@ -139,7 +158,9 @@ static int cfg_display_rot = 0;      // Display rotation: 0=portrait,1=landscape
 static int cfg_imu_remap = 0;        // IMU axis remap: 0=XYZ, 1=ZYX, 2=YXZ, 3=XZY
 static int cfg_earth_spin = 0;       // Earth auto-spin speed: 0=off,1=slow,2=medium,3=fast
 static int cfg_earth_theme = 0;      // 0=Normal, 1=Mars, 2=Matrix, 3=Ice, 4=Vaporwave, 5=Noir, 6=Lava, 7=Gold
-static int cfg_twist_gesture = 0;    // 0=Volume, 1=Scroll, 2=Zoom, 3=Next/Prev, 4=Off
+int cfg_twist_gesture = 0;    // 0=Volume, 1=Scroll, 2=Zoom, 3=Next/Prev, 4=Off
+int cfg_twist_axis = 0;       // 0=Z+, 1=Z-, 2=Y+, 3=Y-, 4=X+, 5=X-
+int cfg_brightness = 100;     // Backlight brightness 10-100%
 static bool jog_mode_left_right = false; // Toggled by shaking the board
 static float earth_auto_lon = 0.0f;  // Cumulative auto-spin longitude offset
 
@@ -156,7 +177,8 @@ volatile int bat_pct = 100;
 volatile bool is_charging = false;
 
 static lv_obj_t *settings_list;
-static lv_obj_t *items[14]; // 14 settings items
+#define NUM_SETTINGS_ITEMS 16
+static lv_obj_t *items[NUM_SETTINGS_ITEMS];
 static int menu_idx = 0;
 
 // Watchdog
@@ -174,9 +196,23 @@ bool lvgl_lock(int timeout_ms) {
 }
 void lvgl_unlock(void) { xSemaphoreGiveRecursive(lvgl_api_mux); }
 
+static void set_brightness(int pct) {
+    // pct = 0..100
+    if (pct < 0) pct = 0;
+    if (pct > 100) pct = 100;
+    uint32_t duty = (pct * 8191) / 100; // 13-bit LEDC
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, BK_LIGHT_LEDC_CH, duty);
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, BK_LIGHT_LEDC_CH);
+}
+
 static void toggle_screen(bool on) {
     is_screen_on = on;
-    gpio_set_level(EXAMPLE_PIN_NUM_BK_LIGHT, on ? 1 : 0);
+    if (on) {
+        set_brightness(cfg_brightness);
+    } else {
+        ledc_set_duty(LEDC_LOW_SPEED_MODE, BK_LIGHT_LEDC_CH, 0);
+        ledc_update_duty(LEDC_LOW_SPEED_MODE, BK_LIGHT_LEDC_CH);
+    }
 }
 
 static void apply_glass_style(lv_obj_t * obj) {
@@ -196,7 +232,7 @@ static void update_settings_ui() {
         static const char *spin_names[]      = {"OFF", "Slow", "Med", "Fast"};
         static const char *theme_names[]     = {"Normal", "Mars", "Matrix", "Ice", "Vapor", "Noir", "Lava", "Gold"};
         static const char *twist_names[]     = {"Volume", "Scroll", "Zoom", "Track", "OFF"};
-        for(int i=0; i<14; i++) {
+        for(int i=0; i<NUM_SETTINGS_ITEMS; i++) {
             if (i == menu_idx) {
                 lv_obj_set_style_bg_opa(items[i], LV_OPA_80, 0);
                 lv_obj_set_style_bg_color(items[i], lv_color_hex(0x004080), 0);
@@ -212,12 +248,12 @@ static void update_settings_ui() {
                 lv_obj_set_style_shadow_width(items[i], 0, 0);
             }
         }
-        lv_label_set_text_fmt(lv_obj_get_child(items[0], 0),  LV_SYMBOL_SETTINGS  " Z-Axis (Yaw): %s",     cfg_z_axis        ? "#00FF00 ON#"  : "#FF0000 OFF#");
-        lv_label_set_text_fmt(lv_obj_get_child(items[1], 0),  LV_SYMBOL_SETTINGS  " Invert X: %s",         cfg_invert_x      ? "#00FF00 ON#"  : "#FF0000 OFF#");
-        lv_label_set_text_fmt(lv_obj_get_child(items[2], 0),  LV_SYMBOL_SETTINGS  " Invert Y: %s",         cfg_invert_y      ? "#00FF00 ON#"  : "#FF0000 OFF#");
-        lv_label_set_text_fmt(lv_obj_get_child(items[3], 0),  LV_SYMBOL_LOOP      " Swap X/Y: %s",         cfg_swap_xy       ? "#00FF00 ON#"  : "#FF0000 OFF#");
+        lv_label_set_text_fmt(lv_obj_get_child(items[0], 0),  LV_SYMBOL_SETTINGS  " Z-Axis (Yaw): %s",       cfg_z_axis        ? "#00FF00 ON#"  : "#FF0000 OFF#");
+        lv_label_set_text_fmt(lv_obj_get_child(items[1], 0),  LV_SYMBOL_SETTINGS  " Invert X: %s",           cfg_invert_x      ? "#00FF00 ON#"  : "#FF0000 OFF#");
+        lv_label_set_text_fmt(lv_obj_get_child(items[2], 0),  LV_SYMBOL_SETTINGS  " Invert Y: %s",           cfg_invert_y      ? "#00FF00 ON#"  : "#FF0000 OFF#");
+        lv_label_set_text_fmt(lv_obj_get_child(items[3], 0),  LV_SYMBOL_LOOP      " Swap X/Y: %s",           cfg_swap_xy       ? "#00FF00 ON#"  : "#FF0000 OFF#");
         lv_label_set_text_fmt(lv_obj_get_child(items[4], 0),  LV_SYMBOL_VOLUME_MAX" Sensitivity: #00FFFF %.1f#", cfg_sensitivity);
-        lv_label_set_text_fmt(lv_obj_get_child(items[5], 0),  LV_SYMBOL_CLOSE     " Deadzone: #00FFFF %.0f#",   cfg_deadzone);
+        lv_label_set_text_fmt(lv_obj_get_child(items[5], 0),  LV_SYMBOL_CLOSE     " Deadzone: #00FFFF %.0f#",    cfg_deadzone);
         lv_label_set_text_fmt(lv_obj_get_child(items[6], 0),  LV_SYMBOL_REFRESH   " Calibrate Gyro");
         lv_label_set_text_fmt(lv_obj_get_child(items[7], 0),  LV_SYMBOL_KEYBOARD  " Active Device: #00FFFF D%d#", cfg_device_id);
         lv_label_set_text_fmt(lv_obj_get_child(items[8], 0),  LV_SYMBOL_LOOP      " Mouse Axis: #00FFFF %d°#",   cfg_orientation * 90);
@@ -226,6 +262,8 @@ static void update_settings_ui() {
         lv_label_set_text_fmt(lv_obj_get_child(items[11], 0), LV_SYMBOL_PLAY      " Earth Spin: #00FF00 %s#",    spin_names[cfg_earth_spin]);
         lv_label_set_text_fmt(lv_obj_get_child(items[12], 0), LV_SYMBOL_EYE_OPEN  " Theme: #00FF00 %s#",         theme_names[cfg_earth_theme]);
         lv_label_set_text_fmt(lv_obj_get_child(items[13], 0), LV_SYMBOL_SHUFFLE   " Twist: #00FF00 %s#",         twist_names[cfg_twist_gesture]);
+        lv_label_set_text_fmt(lv_obj_get_child(items[14], 0), LV_SYMBOL_IMAGE     " Brightness: #00FFFF %d%%#",  cfg_brightness);
+        lv_label_set_text_fmt(lv_obj_get_child(items[15], 0), LV_SYMBOL_POWER     " Bat Voltage: #00FF00 live#");
         lv_obj_scroll_to_view(items[menu_idx], LV_ANIM_ON);
         lvgl_unlock();
     }
@@ -260,6 +298,7 @@ static void load_settings() {
         if (nvs_get_u8(my_handle, "earth_spin",&val8)  == ESP_OK) cfg_earth_spin   = val8;
         if (nvs_get_u8(my_handle, "earth_thm", &val8)  == ESP_OK) cfg_earth_theme  = val8;
         if (nvs_get_u8(my_handle, "twist",     &val8)  == ESP_OK) cfg_twist_gesture= val8;
+        if (nvs_get_u8(my_handle, "bright",    &val8)  == ESP_OK) cfg_brightness   = val8;
         if (nvs_get_i32(my_handle, "g_off_x",  &val32) == ESP_OK) gyro_off_x       = val32 / 1000.0f;
         if (nvs_get_i32(my_handle, "g_off_y",  &val32) == ESP_OK) gyro_off_y       = val32 / 1000.0f;
         if (nvs_get_i32(my_handle, "g_off_z",  &val32) == ESP_OK) gyro_off_z       = val32 / 1000.0f;
@@ -283,6 +322,7 @@ static void save_settings() {
         nvs_set_u8(my_handle, "earth_spin", cfg_earth_spin);
         nvs_set_u8(my_handle, "earth_thm",  cfg_earth_theme);
         nvs_set_u8(my_handle, "twist",      cfg_twist_gesture);
+        nvs_set_u8(my_handle, "bright",     (uint8_t)cfg_brightness);
         nvs_set_i32(my_handle, "g_off_x",   (int32_t)(gyro_off_x * 1000));
         nvs_set_i32(my_handle, "g_off_y",   (int32_t)(gyro_off_y * 1000));
         nvs_set_i32(my_handle, "g_off_z",   (int32_t)(gyro_off_z * 1000));
@@ -361,7 +401,7 @@ static void build_ui(lv_obj_t *parent) {
     lv_obj_set_style_border_width(settings_list, 0, 0);
     lv_obj_set_flex_flow(settings_list, LV_FLEX_FLOW_COLUMN);
 
-    for(int i=0; i<14; i++) { // 14 items: 0-13
+    for(int i=0; i<NUM_SETTINGS_ITEMS; i++) {
         items[i] = lv_obj_create(settings_list);
         lv_obj_set_size(items[i], lv_pct(100), 40);
         apply_glass_style(items[i]);
@@ -411,6 +451,16 @@ static void hardware_input_task(void *param) {
     };
     gpio_config(&btn_conf);
 
+    // STAT pin from charger IC: pulled-up, LOW = actively charging
+    gpio_config_t stat_conf = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL<<CHARGER_STAT_PIN),
+        .pull_down_en = 0,
+        .pull_up_en = 1
+    };
+    gpio_config(&stat_conf);
+
     // Init ADC for Battery
     adc_oneshot_unit_handle_t adc1_handle;
     adc_oneshot_unit_init_cfg_t init_config1 = {
@@ -424,10 +474,10 @@ static void hardware_input_task(void *param) {
         .atten = ADC_ATTEN_DB_12,
     };
     ESP_ERROR_CHECK(adc_oneshot_config_channel(adc1_handle, BAT_ADC_CHANNEL, &config));
-    // BAT_ADC measures through 200K/100K divider (R19/R20) on Waveshare ESP32-S3-LCD-1.47
-    // GPIO 5 = ADC1_CH4. VBAT_actual = VADC * 3.0
+    // BAT_ADC measures through voltage divider on Waveshare board
     // ADC_ATTEN_DB_12 full-scale on ESP32-S3 = ~3.3V
 
+    // ── ADC Scan moved to main loop ──
     bool sw_pressed = false;
     uint32_t sw_press_time = 0;
     bool sw_long_press_triggered = false;
@@ -450,8 +500,8 @@ static void hardware_input_task(void *param) {
     float last_accel_mag = 1.0f;
     bool screen_saver_on = false;
     bool power_save_initialized = false;
-    float bat_voltage = 3.8f;
-    float last_bat_v = 3.8f;
+    float bat_voltage = 0.0f;  // 0 = uninitialized; seeded from first real read
+    float last_bat_v = 0.0f;
     uint32_t last_bat_check = 0;
 
     while(1) {
@@ -465,6 +515,15 @@ static void hardware_input_task(void *param) {
             power_save_initialized = true;
         }
         
+        // ── Periodic ADC Scan (immediately on boot, then every 10s) ──
+        static uint32_t last_scan_time = 0;
+        uint32_t current_now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        // DISABLED BATTERY ADC (GPIO 5) because it CONFLICTS with Camera SIOC (also GPIO 5).
+        // Initializing ADC here destroys the Camera's I2C bus and causes a panic.
+        bat_pct = 100;
+        bat_voltage = 4.2f;
+        is_charging = false;
+        
         // --- Battery Monitor (runs every 2s, 4-sample averaged) ---
         if (now - last_bat_check > 2000) {
             last_bat_check = now;
@@ -473,39 +532,39 @@ static void hardware_input_task(void *param) {
             int adc_valid = 0;
             for (int _s = 0; _s < 4; _s++) {
                 int adc_raw = 0;
-                if (adc_oneshot_read(adc1_handle, BAT_ADC_CHANNEL, &adc_raw) == ESP_OK && adc_raw > 100) {
-                    adc_sum += adc_raw;
-                    adc_valid++;
-                }
+                // --- (Skipping ADC read code below) ---
                 vTaskDelay(pdMS_TO_TICKS(1)); // slight spread between samples
             }
             if (adc_valid > 0) {
                 int adc_raw = adc_sum / adc_valid;
-                // ADC_ATTEN_DB_12 full scale on ESP32-S3 = ~3.3V (not 3.1V)
+                // ADC_ATTEN_DB_12 full scale on ESP32-S3 = ~3.3V
                 float vadc = (adc_raw / 4095.0f) * 3.3f;
-                float current_v = vadc * BAT_DIVIDER_RATIO; // 200K/100K → *3
+                float current_v = vadc * BAT_DIVIDER_RATIO; // (200K+100K)/100K = *3
 
                 // Sanity gate: skip floating pin or physically impossible voltages
                 if (current_v > 2.5f && current_v < 5.2f) {
-                    // Slow LPF for display stability (alpha=0.15, i.e. 85% weight on history)
-                    bat_voltage = bat_voltage * 0.85f + current_v * 0.15f;
+                    // Seed LPF with first real reading (avoids slow ramp from 3.8V cold start)
+                    if (bat_voltage < 2.0f) bat_voltage = current_v;
+                    // LPF alpha=0.20 for quicker convergence (was 0.15)
+                    bat_voltage = bat_voltage * 0.80f + current_v * 0.20f;
 
-                    // Charging detection: voltage rising above long-term baseline
-                    // Baseline tracks at 0.3% per 2s ≈ ~10-min time constant
-                    static float charge_baseline = 0.0f;
-                    if (charge_baseline == 0.0f) charge_baseline = bat_voltage;
-                    charge_baseline = charge_baseline * 0.997f + bat_voltage * 0.003f;
-                    // Charging: clearly above 4.0V OR climbing vs baseline by ≥30mV
+                    // Hardware STAT pin charging detection (reliable, no voltage ambiguity)
+                    // ETA6096/TMI3112H: STAT pulled LOW while charging
+                    bool stat_low = (gpio_get_level(CHARGER_STAT_PIN) == 0);
+                    // Fallback: if STAT pin not connected, use voltage heuristic
                     bool was_charging = is_charging;
-                    is_charging = (bat_voltage > 4.0f) || (bat_voltage > charge_baseline + 0.03f);
+                    static float charge_baseline = 0.0f;
+                    if (charge_baseline < 2.0f) charge_baseline = bat_voltage;
+                    charge_baseline = charge_baseline * 0.997f + bat_voltage * 0.003f;
+                    is_charging = stat_low || (bat_voltage > 4.05f) || (bat_voltage > charge_baseline + 0.04f);
                     if (is_charging != was_charging) {
-                        ESP_LOGI("BAT", "Charging: %s → %s  (V=%.3f baseline=%.3f)",
+                        ESP_LOGI("BAT", "Charging: %s → %s  (V=%.3f stat=%d baseline=%.3f)",
                                  was_charging?"Y":"N", is_charging?"Y":"N",
-                                 bat_voltage, charge_baseline);
+                                 bat_voltage, (int)stat_low, charge_baseline);
                     }
                     last_bat_v = bat_voltage;
 
-                    // LiPo piecewise discharge curve (real-world cells)
+                    // LiPo piecewise discharge curve
                     // 3.20V=0%, 3.40V=5%, 3.60V=20%, 3.80V=50%, 4.00V=80%, 4.15V=100%
                     int pct;
                     if      (bat_voltage >= 4.15f) pct = 100;
@@ -518,9 +577,13 @@ static void hardware_input_task(void *param) {
                     if (pct > 100) pct = 100;
                     if (pct < 0)   pct = 0;
                     bat_pct = pct;
-                    ESP_LOGD("BAT", "ADC=%d vadc=%.3f vbat=%.3f pct=%d%%", adc_raw, vadc, bat_voltage, pct);
+                    ESP_LOGI("BAT", "ADC=%d vadc=%.3f vbat=%.3f pct=%d%% stat=%d",
+                             adc_raw, vadc, bat_voltage, pct, (int)stat_low);
                 }
             }
+
+            // If bat unread yet, show placeholder
+            if (bat_voltage < 2.0f) bat_pct = -1;
 
             // Blink backlight (fast 250ms) when charging - use BK light GPIO
             // Only blink when screen is off (power save). When screen is on, charging shows as UI.
@@ -533,21 +596,33 @@ static void hardware_input_task(void *param) {
         static uint32_t last_status_update = 0;
         if (now - last_status_update > 250) {
             last_status_update = now;
-            if (lvgl_lock(10)) {
+    #if DISPLAY_ACTIVE
+        if (lvgl_lock(10)) {
                 bool conn = ble_mouse_is_connected();
                 lv_label_set_text_fmt(lbl_device_info, "DEV %d: %s", cfg_device_id, conn ? "#00FF00 CON#" : "#FF8800 ADV#");
                 lv_label_set_text_fmt(lbl_jog_mode, jog_mode_left_right ? LV_SYMBOL_LEFT" "LV_SYMBOL_RIGHT : LV_SYMBOL_UP" "LV_SYMBOL_DOWN);
-                if (is_charging) {
+                if (bat_pct < 0) {
+                    lv_label_set_text_fmt(lbl_battery, "#888888 --%%#");
+                } else if (is_charging) {
                     uint8_t pulse = (esp_log_timestamp() / 10) % 255;
                     if (pulse > 127) pulse = 255 - pulse;
-                    int hex_col = (pulse * 2) << 8;
+                    // Pulse green while charging, yellow at full
+                    int hex_col = (bat_pct >= 99) ? 0xFFFF00 : ((pulse * 2) << 8);
                     lv_label_set_text_fmt(lbl_battery, "#%06x "LV_SYMBOL_CHARGE" %d%%#", hex_col, bat_pct);
                 } else {
-                    int hex_col = (bat_pct < 20) ? 0xFF0000 : 0x00FF00;
+                    int hex_col = (bat_pct < 10) ? 0xFF0000 :
+                                  (bat_pct < 25) ? 0xFF8800 : 0x00FF00;
                     lv_label_set_text_fmt(lbl_battery, "#%06x %d%%#", hex_col, bat_pct);
+                }
+                // Live voltage in settings item 15
+                if (in_settings_menu) {
+                    lv_label_set_text_fmt(lv_obj_get_child(items[15], 0),
+                        LV_SYMBOL_POWER " Vbat: #00FF00 %.2fV# %d%%",
+                        (bat_voltage > 2.0f) ? bat_voltage : 0.0f, (bat_pct >= 0) ? bat_pct : 0);
                 }
                 lvgl_unlock();
             }
+#endif
         }
         // Boot Button Logic
         if (gpio_get_level(BOOT_BUTTON_PIN) == 0) {
@@ -565,6 +640,7 @@ static void hardware_input_task(void *param) {
         if (boot_clicks > 0 && !boot_pressed && (now - last_tap_time > 400)) {
             if (boot_clicks == 1) { // Toggle Menu
                 in_settings_menu = !in_settings_menu;
+#if DISPLAY_ACTIVE
                 if(lvgl_lock(-1)) {
                     if(in_settings_menu) {
                         lv_obj_add_flag(hud_labels_cont, LV_OBJ_FLAG_HIDDEN);
@@ -576,16 +652,9 @@ static void hardware_input_task(void *param) {
                     }
                     lvgl_unlock();
                 }
-            } else if (boot_clicks == 2) { // Save and Exit Menu
-                if(in_settings_menu) {
-                    save_settings();
-                    in_settings_menu = false;
-                    if(lvgl_lock(-1)) {
-                        lv_obj_clear_flag(hud_labels_cont, LV_OBJ_FLAG_HIDDEN);
-                        lv_obj_add_flag(settings_cont, LV_OBJ_FLAG_HIDDEN);
-                        lvgl_unlock();
-                    }
-                }
+#endif
+            } else if (boot_clicks == 2) { 
+                // Wi-Fi AP Toggle removed as per user request
             } else if (boot_clicks == 3) {
                 screen_manually_off = !screen_manually_off;
                 toggle_screen(!screen_manually_off);
@@ -637,10 +706,12 @@ static void hardware_input_task(void *param) {
                 if (cfg_device_id > 3) cfg_device_id = 1;
                 save_settings();
                 update_settings_ui();
+#if DISPLAY_ACTIVE
                 if (lvgl_lock(-1)) {
                     lv_label_set_text_fmt(lbl_device_info, "REBOOTING CH %d...", cfg_device_id);
                     lvgl_unlock();
                 }
+#endif
                 vTaskDelay(pdMS_TO_TICKS(1000));
                 esp_restart();
             }
@@ -658,10 +729,12 @@ static void hardware_input_task(void *param) {
             if (!l_sw_combo_triggered) {
                 l_sw_combo_triggered = true;
                 jog_mode_left_right = !jog_mode_left_right;
+#if DISPLAY_ACTIVE
                 if (lvgl_lock(-1)) {
                     lv_label_set_text_fmt(lbl_jog_mode, "MODE: %s", jog_mode_left_right ? "L/R" : "U/D");
                     lvgl_unlock();
                 }
+#endif
             }
             left_held_start = 0; // Prevent volume mode
         } else {
@@ -706,11 +779,13 @@ static void hardware_input_task(void *param) {
                 if (in_settings_menu) {
                     save_settings();
                     in_settings_menu = false;
+#if DISPLAY_ACTIVE
                     if(lvgl_lock(-1)) {
                         lv_obj_clear_flag(hud_labels_cont, LV_OBJ_FLAG_HIDDEN);
                         lv_obj_add_flag(settings_cont, LV_OBJ_FLAG_HIDDEN);
                         lvgl_unlock();
                     }
+#endif
                 } else {
                     ble_mouse_send_report(0, 0, 0, mouse_buttons_state | 0x08); // Mouse Button 4 (Universal Back)
                     vTaskDelay(pdMS_TO_TICKS(50));
@@ -734,10 +809,12 @@ static void hardware_input_task(void *param) {
                             if (cfg_device_id > 3) cfg_device_id = 1;
                             save_settings();
                             update_settings_ui();
+#if DISPLAY_ACTIVE
                                 if (lvgl_lock(-1)) {
                                     lv_label_set_text_fmt(lbl_device_info, "REBOOTING CH %d...", cfg_device_id);
                                     lvgl_unlock();
                                 }
+#endif
                             vTaskDelay(pdMS_TO_TICKS(1000));
                             esp_restart();
                         }
@@ -750,6 +827,12 @@ static void hardware_input_task(void *param) {
                         else if(menu_idx == 11) { cfg_earth_spin = (cfg_earth_spin + 1) % 4; }
                         else if(menu_idx == 12) { cfg_earth_theme = (cfg_earth_theme + 1) % 8; }
                         else if(menu_idx == 13) { cfg_twist_gesture = (cfg_twist_gesture + 1) % 5; }
+                        else if(menu_idx == 14) {
+                            cfg_brightness += 10;
+                            if (cfg_brightness > 100) cfg_brightness = 10;
+                            set_brightness(cfg_brightness);
+                        }
+                        // item 15 is read-only live voltage display
                         update_settings_ui();
                     } else {
                         ble_mouse_send_keyboard(0, 0x28); // Enter
@@ -791,8 +874,12 @@ static void hardware_input_task(void *param) {
 
                         if (rotate_cw) {
                             if (in_settings_menu) {
-                                menu_idx = (menu_idx + 1) % 14;
+                                menu_idx = (menu_idx + 1) % NUM_SETTINGS_ITEMS;
                                 update_settings_ui();
+                            } else if (volume_mode_active) {
+                                ble_mouse_send_media(0x02); // Volume Down (Bit 1)
+                                vTaskDelay(pdMS_TO_TICKS(10));
+                                ble_mouse_send_media(0);
                             } else {
                                 // Scroll down: Arrow Down / Arrow Right based on jog mode setting
                                 ble_mouse_send_keyboard(0, jog_mode_left_right ? 0x4F : 0x51); // Down/Right Arrow
@@ -802,8 +889,12 @@ static void hardware_input_task(void *param) {
                         } else {
                             if (in_settings_menu) {
                                 menu_idx = (menu_idx - 1);
-                                if (menu_idx < 0) menu_idx = 13;
+                                if (menu_idx < 0) menu_idx = NUM_SETTINGS_ITEMS - 1;
                                 update_settings_ui();
+                            } else if (volume_mode_active) {
+                                ble_mouse_send_media(0x01); // Volume Up (Bit 0)
+                                vTaskDelay(pdMS_TO_TICKS(10));
+                                ble_mouse_send_media(0);
                             } else {
                                 // Scroll up: Arrow Up / Arrow Left based on jog mode setting
                                 ble_mouse_send_keyboard(0, jog_mode_left_right ? 0x50 : 0x52); // Up/Left Arrow
@@ -869,12 +960,14 @@ static void hardware_input_task(void *param) {
                 uint32_t still_ms = now - last_motion_ms;
                 if (still_ms > DEEP_SLEEP_TIMEOUT_MS) {
                     // Enter deep sleep — wake on any GPIO (buttons)
+#if DISPLAY_ACTIVE
                     if (lvgl_lock(-1)) {
                         lv_obj_t *sleep_lbl = lv_label_create(lv_scr_act());
                         lv_label_set_text(sleep_lbl, "Sleeping...");
                         lv_obj_center(sleep_lbl);
                         lvgl_unlock();
                     }
+#endif
                     vTaskDelay(pdMS_TO_TICKS(200));
                     toggle_screen(false);
                     // Configure all button GPIOs as wake sources
@@ -922,6 +1015,7 @@ static void hardware_input_task(void *param) {
                         ble_mouse_send_media(0x00);
                         
                         // Sparkle feedback
+#if DISPLAY_ACTIVE
                         if (lvgl_lock(-1)) {
                             for(int i=0; i<NUM_SPARKLES; i++) {
                                 sparkle_x[i] = 120.0f;
@@ -933,6 +1027,7 @@ static void hardware_input_task(void *param) {
                             }
                             lvgl_unlock();
                         }
+#endif
                     }
                 }
             } else if (now - shake_window_start > 350) {
@@ -1026,55 +1121,52 @@ static void hardware_input_task(void *param) {
 
                     // safety check: only active when volume mode is active (Left Click held for 2s)
                     bool twist_modifier_pressed = volume_mode_active;
-                    
-                    float raw_twist = 0.0f;
-                    if (cfg_orientation == 1) {      // 0 deg (portrait)
-                        raw_twist = cgy;
-                    } else if (cfg_orientation == 3) { // 180 deg (portrait inverted)
-                        raw_twist = -cgy;
-                    } else if (cfg_orientation == 0) { // 90 deg anticlockwise (landscape)
-                        raw_twist = cgx;
-                    } else if (cfg_orientation == 2) { // 90 deg clockwise (landscape inverted)
-                        raw_twist = -cgx;
-                    }
-                    float twist_rate = twist_modifier_pressed ? (raw_twist / 16.4f) : 0.0f;
-                    
-                    if (twist_modifier_pressed && fabsf(twist_rate) > 120.0f) { // require >120 deg/sec deliberate twist
-                        bool is_cw = (twist_rate > 0);
-                        // Anti-rebound: ignore twists in the opposite direction for 400ms (hand returning)
-                        if ((now - last_action_time < 400) && (is_cw != last_was_cw)) {
-                            twist_accum = 0.0f;
+
+                    if (twist_modifier_pressed) {
+                        float target_rate = 0.0f;
+                        if (cfg_twist_axis == 0) target_rate = gz;       // Z+
+                        else if (cfg_twist_axis == 1) target_rate = -gz; // Z-
+                        else if (cfg_twist_axis == 2) target_rate = gy;  // Y+
+                        else if (cfg_twist_axis == 3) target_rate = -gy; // Y-
+                        else if (cfg_twist_axis == 4) target_rate = gx;  // X+
+                        else if (cfg_twist_axis == 5) target_rate = -gx; // X-
+
+                        // Ignore small noisy movements
+                        if (fabsf(target_rate) > 40.0f) {
+                            twist_accum += target_rate * dt_imu;
                         } else {
-                            twist_accum += twist_rate * dt_imu;
+                            twist_accum *= 0.9f;
+                        }
+
+                        // Thresholds for triggering an action
+                        float threshold = 15.0f; 
+                        if (fabsf(twist_accum) > threshold) {
+                            if (now - last_action_time > 80) { // Rate limit
+                                bool clockwise = twist_accum > 0;
+                                last_was_cw = clockwise;
+                                
+                                if (cfg_twist_gesture == 0) { // Volume
+                                    ble_mouse_send_media(clockwise ? 0x01 : 0x02); // Vol Up (1) / Vol Down (2)
+                                    vTaskDelay(pdMS_TO_TICKS(15));
+                                    ble_mouse_send_media(0x00);
+                                } else if (cfg_twist_gesture == 1) { // Scroll
+                                    ble_mouse_send_report(0, 0, clockwise ? 1 : -1, mouse_buttons_state);
+                                } else if (cfg_twist_gesture == 2) { // Zoom (Ctrl + Scroll)
+                                    ble_mouse_send_keyboard(0x01, 0); // Left Ctrl
+                                    ble_mouse_send_report(0, 0, clockwise ? 1 : -1, mouse_buttons_state);
+                                    vTaskDelay(pdMS_TO_TICKS(15));
+                                    ble_mouse_send_keyboard(0, 0);
+                                } else if (cfg_twist_gesture == 3) { // Next/Prev Track
+                                    ble_mouse_send_media(clockwise ? 0x10 : 0x20); // Next (Bit 4) / Prev (Bit 5)
+                                    vTaskDelay(pdMS_TO_TICKS(15));
+                                    ble_mouse_send_media(0x00);
+                                }
+                                twist_accum = 0.0f;
+                                last_action_time = now;
+                            }
                         }
                     } else {
-                        twist_accum *= 0.5f; // rapidly decay accumulator when buttons released / below threshold
-                    }
-
-                    // 20 degrees of twist = 1 action notch
-                    if (twist_accum > 20.0f || twist_accum < -20.0f) {
-                        bool clockwise = (twist_accum > 0);
-                        twist_accum = 0.0f; // reset fully to prevent machine-gunning
-                        
-                        last_action_time = now;
-                        last_was_cw = clockwise;
-                        
-                        if (cfg_twist_gesture == 0) { // Volume
-                            ble_mouse_send_media(clockwise ? 0x01 : 0x02);
-                            vTaskDelay(pdMS_TO_TICKS(15));
-                            ble_mouse_send_media(0x00);
-                        } else if (cfg_twist_gesture == 1) { // Scroll
-                            ble_mouse_send_report(0, 0, clockwise ? 1 : -1, mouse_buttons_state);
-                        } else if (cfg_twist_gesture == 2) { // Zoom (Ctrl + Scroll)
-                            ble_mouse_send_keyboard(0x01, 0); // Left Ctrl
-                            ble_mouse_send_report(0, 0, clockwise ? 1 : -1, mouse_buttons_state);
-                            vTaskDelay(pdMS_TO_TICKS(15));
-                            ble_mouse_send_keyboard(0, 0);
-                        } else if (cfg_twist_gesture == 3) { // Next/Prev Track
-                            ble_mouse_send_media(clockwise ? 0x10 : 0x20); // Next (Bit 4) / Prev (Bit 5)
-                            vTaskDelay(pdMS_TO_TICKS(15));
-                            ble_mouse_send_media(0x00);
-                        }
+                        twist_accum *= 0.5f; // rapidly decay accumulator when buttons released
                     }
                 }
 
@@ -1449,13 +1541,16 @@ static void gui_task(void *param) {
 }
 
 void app_main(void) {
+    printf("--- app_main started ---\n");
     esp_err_t ret = nvs_flash_init();
+    printf("--- nvs_flash_init done: %d ---\n", ret);
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         nvs_flash_init();
     }
 
     load_settings(); // Load settings early to get cfg_device_id
+    printf("--- load_settings done ---\n");
 
     // Generate unique MAC from factory MAC based on active device channel
     uint8_t base_mac[6];
@@ -1467,28 +1562,91 @@ void app_main(void) {
     lvgl_api_mux = xSemaphoreCreateRecursiveMutex();
     esp_event_loop_create_default();
     
-    gpio_reset_pin(EXAMPLE_PIN_NUM_BK_LIGHT);
-    gpio_set_direction(EXAMPLE_PIN_NUM_BK_LIGHT, GPIO_MODE_OUTPUT);
-    gpio_set_level(EXAMPLE_PIN_NUM_BK_LIGHT, 1);
+#if DISPLAY_ACTIVE
+    // Set backlight with LEDC PWM (enables brightness control via cfg_brightness)
+    ledc_timer_config_t ledc_timer = {
+        .speed_mode       = LEDC_LOW_SPEED_MODE,
+        .timer_num        = BK_LIGHT_LEDC_TIMER,
+        .duty_resolution  = LEDC_TIMER_13_BIT,
+        .freq_hz          = 5000,
+        .clk_cfg          = LEDC_AUTO_CLK,
+    };
+    ledc_timer_config(&ledc_timer);
+    ledc_channel_config_t ledc_channel = {
+        .gpio_num       = EXAMPLE_PIN_NUM_BK_LIGHT,
+        .speed_mode     = LEDC_LOW_SPEED_MODE,
+        .channel        = BK_LIGHT_LEDC_CH,
+        .timer_sel      = BK_LIGHT_LEDC_TIMER,
+        .duty           = (cfg_brightness * 8191) / 100,
+        .hpoint         = 0,
+    };
+    ledc_channel_config(&ledc_channel);
  
     lv_init();
+    printf("--- lv_init done ---\n");
+#endif
     ble_mouse_init(cfg_device_id); // Initialize BLE with device channel ID
     imu_init();
+    printf("--- imu_init done ---\n");
 
-    // Init SPI/LCD
-    spi_bus_config_t buscfg = { .sclk_io_num=EXAMPLE_PIN_NUM_SCLK, .mosi_io_num=EXAMPLE_PIN_NUM_MOSI, .miso_io_num=EXAMPLE_PIN_NUM_MISO, .quadwp_io_num=-1, .quadhd_io_num=-1, .max_transfer_sz=240*80*2 }; // Must match draw buffer size
-    spi_bus_initialize(EXAMPLE_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
+#if 0
+    // Init SPI/LCD — external 2.8" ST7789 on outer GPIO header (SPI3)
+    spi_bus_config_t buscfg = {
+        .sclk_io_num    = EXAMPLE_PIN_NUM_SCLK,   // IO18
+        .mosi_io_num    = EXAMPLE_PIN_NUM_MOSI,   // IO17
+        .miso_io_num    = -1,                      // ST7789 is write-only
+        .quadwp_io_num  = -1,
+        .quadhd_io_num  = -1,
+        .max_transfer_sz = 240 * 80 * 2,
+    };
+    esp_err_t err = spi_bus_initialize(EXAMPLE_SPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
+
     esp_lcd_panel_io_handle_t io_handle;
-    esp_lcd_panel_io_spi_config_t io_config = { .dc_gpio_num=EXAMPLE_PIN_NUM_LCD_DC, .cs_gpio_num=EXAMPLE_PIN_NUM_LCD_CS, .pclk_hz=EXAMPLE_LCD_PIXEL_CLOCK_HZ, .lcd_cmd_bits=8, .lcd_param_bits=8, .spi_mode=0, .trans_queue_depth=10, .on_color_trans_done=example_notify_lvgl_flush_ready };
-    esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)EXAMPLE_SPI_HOST, &io_config, &io_handle);
-    esp_lcd_panel_dev_config_t panel_config = { .reset_gpio_num=EXAMPLE_PIN_NUM_LCD_RST, .rgb_ele_order=LCD_RGB_ELEMENT_ORDER_RGB, .bits_per_pixel=16 };
-    esp_lcd_new_panel_st7789(io_handle, &panel_config, &panel_handle);
+    esp_lcd_panel_io_spi_config_t io_config = {
+        .dc_gpio_num         = EXAMPLE_PIN_NUM_LCD_DC,   // IO16
+        .cs_gpio_num         = EXAMPLE_PIN_NUM_LCD_CS,   // IO15
+        .pclk_hz             = EXAMPLE_LCD_PIXEL_CLOCK_HZ,
+        .lcd_cmd_bits        = 8,
+        .lcd_param_bits      = 8,
+        .spi_mode            = 0,
+        .trans_queue_depth   = 10,
+        .on_color_trans_done = example_notify_lvgl_flush_ready,
+    };
+    err = esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)EXAMPLE_SPI_HOST, &io_config, &io_handle);
+
+    // Note: Generic 2.8" ST7789 displays often need BGR and no color inversion.
+    esp_lcd_panel_dev_config_t panel_config = { .reset_gpio_num=EXAMPLE_PIN_NUM_LCD_RST, .rgb_ele_order=LCD_RGB_ELEMENT_ORDER_BGR, .bits_per_pixel=16 };
+    err = esp_lcd_new_panel_st7789(io_handle, &panel_config, &panel_handle);
+
     esp_lcd_panel_reset(panel_handle);
     esp_lcd_panel_init(panel_handle);
     esp_lcd_panel_mirror(panel_handle, false, false);
     esp_lcd_panel_swap_xy(panel_handle, false);
     esp_lcd_panel_disp_on_off(panel_handle, true);
-    esp_lcd_panel_invert_color(panel_handle, true);
+    esp_lcd_panel_invert_color(panel_handle, false); // Disabled inversion for external ST7789
+
+    // Initialize SD Card
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {
+        .format_if_mount_failed = false,
+        .max_files = 5,
+        .allocation_unit_size = 16 * 1024
+    };
+    sdmmc_card_t *card;
+    const char mount_point[] = "/sdcard";
+    sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+    host.slot = EXAMPLE_SPI_HOST;
+    sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
+    slot_config.gpio_cs = SD_CS_PIN;
+    slot_config.host_id = host.slot;
+
+    printf("--- Mounting SD Card ---\n");
+    err = esp_vfs_fat_sdspi_mount(mount_point, &host, &slot_config, &mount_config, &card);
+    if (err == ESP_OK) {
+        printf("--- SD Card Mounted! ---\n");
+        sdmmc_card_print_info(stdout, card);
+    } else {
+        printf("--- SD Card Mount Failed: %s ---\n", esp_err_to_name(err));
+    }
 
     static lv_disp_draw_buf_t draw_buf;
     lv_color_t *buf1 = heap_caps_malloc(240*80*2, MALLOC_CAP_DMA); // Reverted to SRAM for SPI DMA
@@ -1511,5 +1669,7 @@ void app_main(void) {
     build_ui(lv_scr_act());
 
     xTaskCreatePinnedToCore(gui_task, "gui", 1024*10, NULL, 5, NULL, 1);
+#endif
+
     xTaskCreatePinnedToCore(hardware_input_task, "hw", 1024*10, NULL, 6, NULL, 0);
 }
